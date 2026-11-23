@@ -159,6 +159,8 @@ tbody tr:last-child td { border-bottom: none; }
 .banner { border-radius: 10px; padding: 0.8rem 1rem; border: 1px solid var(--line); }
 .banner-bad { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
 .banner-good { background: var(--good-bg); border-color: var(--good); color: var(--good); }
+.banner-warn { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.banner a { color: inherit; }
 
 .readings { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .reading {

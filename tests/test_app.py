@@ -419,6 +419,291 @@ class AppTests(unittest.TestCase):
     def test_missing_session(self):
         self.assertEqual(self.client.get("/sessions/9999").status_code, 404)
 
+    # -- corrected timing table -------------------------------------------
+
+    CORRECTED_TEMPLATE = """lap,source,cumulative_ms
+1,主计时,75000
+1,备计时,74230
+2,主计时,148900
+2,备计时,148870
+3,主计时,224000
+3,备计时,223640
+"""
+
+    def _correct(self, text, expected_version=None):
+        with self.app.app_context():
+            version = self.app.get_db().execute(
+                "SELECT laps_version FROM sessions WHERE id = ?",
+                (self._session_id(),),
+            ).fetchone()[0]
+        data = {
+            "expected_version": str(
+                version if expected_version is None else expected_version
+            ),
+            "csv_file": (io.BytesIO(text.encode("utf-8")), "corrected.csv"),
+        }
+        return self.client.post(
+            f"/sessions/{self._session_id()}/correct",
+            data=data,
+            content_type="multipart/form-data",
+        )
+
+    def _session_row(self):
+        with self.app.app_context():
+            return self.app.get_db().execute(
+                "SELECT * FROM sessions WHERE id = ?", (self._session_id(),)
+            ).fetchone()
+
+    def test_correction_keeps_approved_reading_and_recalculates(self):
+        self.import_csv()
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        before_pin = self._lap_row(2)["pinned_reading_id"]
+
+        response = self._correct(self.CORRECTED_TEMPLATE)
+        self.assertEqual(response.status_code, 302)
+
+        session = self._session_row()
+        self.assertEqual(session["laps_version"], 2)
+        self.assertEqual(session["revision"], 3)
+
+        pin = self._lap_row(2)["pinned_reading_id"]
+        self.assertIsNotNone(pin)
+        self.assertNotEqual(pin, before_pin)  # new row, same reading
+        with self.app.app_context():
+            pinned = self.app.get_db().execute(
+                "SELECT source, cumulative_ms FROM readings WHERE id = ?", (pin,)
+            ).fetchone()
+        self.assertEqual((pinned["source"], pinned["cumulative_ms"]), ("备计时", 148870))
+
+        page = self.client.get(f"/sessions/{self._session_id()}")
+        body = page.get_data(as_text=True)
+        self.assertIn("75000 ms", body)
+        self.assertIn("已核定", body)
+        # Old table version is still available through the version view.
+        old = self.client.get(f"/sessions/{self._session_id()}?revision=2")
+        self.assertIn("74210 ms", old.get_data(as_text=True))
+
+    def test_correction_rejects_changed_approved_reading(self):
+        self.import_csv()
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        changed = self.CORRECTED_TEMPLATE.replace("2,备计时,148870", "2,备计时,148880")
+        response = self._correct(changed)
+        self.assertEqual(response.status_code, 409)
+        body = response.get_data(as_text=True)
+        self.assertIn("第 2 圈", body)
+        self.assertIn("被改动", body)
+        self.assertEqual(self._session_row()["laps_version"], 1)
+
+    def test_correction_rejects_missing_approved_reading(self):
+        self.import_csv()
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        removed = "\n".join(
+            line
+            for line in self.CORRECTED_TEMPLATE.splitlines()
+            if line != "2,备计时,148870"
+        ) + "\n"
+        response = self._correct(removed)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("缺失", response.get_data(as_text=True))
+        self.assertEqual(self._session_row()["laps_version"], 1)
+
+    def test_correction_rejects_different_lap_range(self):
+        self.import_csv()
+        shorter = """lap,source,cumulative_ms
+1,主计时,74210
+1,备计时,74230
+2,主计时,148900
+2,备计时,148870
+"""
+        response = self._correct(shorter)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("圈号范围", response.get_data(as_text=True))
+        self.assertEqual(self._session_row()["laps_version"], 1)
+
+    def test_correction_uses_latest_approval_at_submit(self):
+        self.import_csv()
+        # A page was rendered with lap 2 unpinned, then another judge pins
+        # lap 2 backup, and only afterwards the corrected table (without that
+        # reading) is uploaded.
+        self.client.get(f"/sessions/{self._session_id()}")
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        removed = "\n".join(
+            line
+            for line in self.CORRECTED_TEMPLATE.splitlines()
+            if line != "2,备计时,148870"
+        ) + "\n"
+        response = self._correct(removed)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("第 2 圈", response.get_data(as_text=True))
+
+    def test_correction_rejected_when_no_feasible_sequence(self):
+        self.import_csv()
+        self.assertEqual(self._pin(1, "主计时").status_code, 302)
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        # Approved readings are preserved, but the corrected lap 3 now starts
+        # too soon after lap 2, so the pinned sequence has no completion.
+        impossible = """lap,source,cumulative_ms
+1,主计时,74210
+1,备计时,74230
+2,主计时,148900
+2,备计时,148870
+3,主计时,200000
+3,备计时,200100
+"""
+        response = self._correct(impossible)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("完整可行序列", response.get_data(as_text=True))
+        session = self._session_row()
+        self.assertEqual(session["laps_version"], 1)
+        self.assertEqual(session["revision"], 3)
+        with self.app.app_context():
+            connection = self.app.get_db()
+            # The rejected correction must leave no new rows behind.
+            count = connection.execute(
+                "SELECT COUNT(*) FROM readings WHERE table_version = 2"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            corrections = connection.execute(
+                "SELECT COUNT(*) FROM corrections"
+            ).fetchone()[0]
+            self.assertEqual(corrections, 0)
+
+    def test_approval_from_page_before_correction_is_rejected(self):
+        self.import_csv()
+        page = self.client.get(f"/sessions/{self._session_id()}")
+        self.assertEqual(page.status_code, 200)
+        # The page carries readings_version=1 and ids of table version 1.
+        stale_reading_id = self._reading_id(1, "主计时")
+        self.assertEqual(self._correct(self.CORRECTED_TEMPLATE).status_code, 302)
+
+        response = self.client.post(
+            f"/sessions/{self._session_id()}/approve",
+            data={
+                "lap_number": "1",
+                "reading_id": str(stale_reading_id),
+                "expected_pin": "none",
+                "readings_version": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 409)
+        body = response.get_data(as_text=True)
+        self.assertIn("更正版读数表", body)
+        self.assertIn("刷新", body)
+        self.assertIsNone(self._lap_row(1)["pinned_reading_id"])
+
+    def test_stale_correction_is_rejected(self):
+        self.import_csv()
+        self.assertEqual(self._correct(self.CORRECTED_TEMPLATE).status_code, 302)
+        response = self._correct(self.CORRECTED_TEMPLATE, expected_version=1)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("另一份更正版", response.get_data(as_text=True))
+        self.assertEqual(self._session_row()["laps_version"], 2)
+
+    def test_version_view_includes_pre_correction_state(self):
+        self.import_csv()
+        self.assertEqual(self._pin(2, "备计时").status_code, 302)
+        corrected = self.CORRECTED_TEMPLATE.replace(
+            "1,主计时,75000", "1,主计时,74210"
+        )
+        self.assertEqual(self._correct(corrected).status_code, 302)
+
+        old = self.client.get(f"/sessions/{self._session_id()}?revision=1")
+        self.assertEqual(old.status_code, 200)
+        body = old.get_data(as_text=True)
+        self.assertIn("74210 ms", body)  # lap 1 primary before correction
+        self.assertIn("版本 1", body)
+
+        # Revision 2 is the approval before the correction: its snapshot keeps
+        # that approval even though the live pin moved to the new table.
+        approved = self.client.get(f"/sessions/{self._session_id()}?revision=2")
+        self.assertEqual(approved.status_code, 200)
+        approved_body = approved.get_data(as_text=True)
+        self.assertIn("148870 ms", approved_body)
+        self.assertIn("已核定", approved_body)
+        self.assertNotIn("核定此圈", approved_body)
+
+        # The post-correction revision still shows the original lap 1 reading.
+        after = self.client.get(f"/sessions/{self._session_id()}?revision=3")
+        self.assertEqual(after.status_code, 200)
+        self.assertIn("74210 ms", after.get_data(as_text=True))
+
+        # A version that no longer exists is a 404.
+        self.assertEqual(
+            self.client.get(f"/sessions/{self._session_id()}?revision=99").status_code,
+            404,
+        )
+
+    def test_correction_and_approval_race_stays_consistent(self):
+        """An approval and a correction submitted together must not interleave
+        into a stale pin on the new table."""
+
+        import threading
+
+        self.import_csv()
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, int] = {}
+
+        def approve():
+            client = self.app.test_client()
+            client.get(f"/sessions/{self._session_id()}")
+            barrier.wait()
+            response = client.post(
+                f"/sessions/{self._session_id()}/approve",
+                data={
+                    "lap_number": "1",
+                    "reading_id": str(self._reading_id(1, "主计时")),
+                    "expected_pin": "none",
+                    "readings_version": "1",
+                },
+            )
+            outcomes["approve"] = response.status_code
+
+        def correct():
+            client = self.app.test_client()
+            barrier.wait()
+            # Lap 1 stays byte-identical so the correction is valid whether
+            # the approval landed first or second; only lap 3 changes.
+            text = self.CORRECTED_TEMPLATE.replace(
+                "1,主计时,75000", "1,主计时,74210"
+            )
+            response = client.post(
+                f"/sessions/{self._session_id()}/correct",
+                data={
+                    "expected_version": "1",
+                    "csv_file": (io.BytesIO(text.encode()), "c.csv"),
+                },
+                content_type="multipart/form-data",
+            )
+            outcomes["correct"] = response.status_code
+
+        threads = [threading.Thread(target=approve), threading.Thread(target=correct)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(outcomes["correct"], 302)
+        self.assertIn(outcomes["approve"], (302, 409))
+
+        session = self._session_row()
+        self.assertEqual(session["laps_version"], 2)
+        pin = self._lap_row(1)["pinned_reading_id"]
+        if outcomes["approve"] == 302:
+            self.assertEqual(session["revision"], 3)
+            self.assertIsNotNone(pin)
+            with self.app.app_context():
+                pinned = self.app.get_db().execute(
+                    "SELECT table_version, source, cumulative_ms FROM readings WHERE id = ?",
+                    (pin,),
+                ).fetchone()
+            self.assertEqual(
+                (pinned["table_version"], pinned["source"], pinned["cumulative_ms"]),
+                (2, "主计时", 74210),
+            )
+        else:
+            self.assertIsNone(pin)
+            self.assertEqual(session["revision"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

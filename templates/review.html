@@ -9,7 +9,7 @@
 <body>
 <header class="topbar">
   <a class="brand" href="{{ url_for('index') }}">骑行赛计时复核</a>
-  <span class="muted">批次 #{{ session.id }} · 版本 {{ session.revision }}</span>
+  <span class="muted">批次 #{{ session.id }} · 当前版本 {{ session.revision }} · 读数表 v{{ session.laps_version }}</span>
 </header>
 <main>
   {% with messages = get_flashed_messages(with_categories=true) %}
@@ -23,12 +23,32 @@
 
   <section class="card">
     <h1>{{ session.name }}</h1>
+    {% if historical %}
+      <div class="banner banner-warn" role="status">
+        正在查看历史版本 {{ viewing_revision }}（当时读数表 v{{ readings_version }}）。
+        下方核准的读数、核定与结论均按该版本保存，仅供查阅，不能在历史页面上核定。
+        <a href="{{ url_for('review_session', session_id=session.id) }}">回到当前版本</a>
+      </div>
+    {% endif %}
     <dl class="facts">
-      <div><dt>最短可信圈时</dt><dd>{{ session.min_lap_ms | lap_time }}</dd></div>
-      <div><dt>现有纪录</dt><dd>{{ session.record_ms | lap_time }}</dd></div>
+      <div><dt>最短可信圈时</dt><dd>{{ view_min_lap_ms | lap_time }}</dd></div>
+      <div><dt>现有纪录</dt><dd>{{ view_record_ms | lap_time }}</dd></div>
       <div><dt>圈数</dt><dd>{{ laps | length }}</dd></div>
-      <div><dt>提交版本</dt><dd>{{ session.revision }}</dd></div>
+      <div><dt>查看版本</dt><dd>{{ viewing_revision if historical else session.revision }}</dd></div>
+      <div><dt>读数表版本</dt><dd>v{{ readings_version }}</dd></div>
     </dl>
+
+    <form method="get" action="{{ url_for('review_session', session_id=session.id) }}" class="inline-form">
+      <label>按版本查看
+        <select name="revision" onchange="this.form.submit()">
+          <option value="" {% if not historical %}selected{% endif %}>当前版本（{{ session.revision }}）</option>
+          {% for item in revisions if item != session.revision %}
+            <option value="{{ item }}" {% if historical and viewing_revision == item %}selected{% endif %}>版本 {{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <noscript><button type="submit">查看</button></noscript>
+    </form>
 
     {% if conclusion %}
       <div class="verdict tone-{{ status_tone.get(conclusion.status, 'neutral') }}">
@@ -40,22 +60,22 @@
           <p>{{ conclusion.reason }}</p>
         {% else %}
           <p>最快圈用时可达范围：<strong>{{ conclusion.lower_ms | lap_time }} – {{ conclusion.upper_ms | lap_time }}</strong></p>
-          <p class="muted">现有纪录 {{ conclusion.record_ms | lap_time }}。只有最快圈严格快于纪录才算破纪录；范围上端低于纪录为确定破纪录，范围下端不低于纪录为确定未破，二者之间为待核。</p>
+          <p class="muted">现有纪录 {{ view_record_ms | lap_time }}。只有最快圈严格快于纪录才算破纪录；范围上端低于纪录为确定破纪录，范围下端不低于纪录为确定未破，二者之间为待核。</p>
         {% endif %}
       </div>
     {% endif %}
   </section>
 
   <section class="card">
-    <h2>每圈读数</h2>
-    <p class="muted">未核定的圈会把该圈全部来源纳入可行序列；核定后仅使用核定读数。提交时会在事务内读取其他圈的最新核定状态重算；若同一圈已被另一位裁判抢先改定，或重算后无可行序列，则拒绝并保留原状。</p>
+    <h2>每圈读数{% if historical %}（版本 {{ viewing_revision }} 快照）{% endif %}</h2>
+    <p class="muted">未核定的圈会把该圈全部来源纳入可行序列；核定后仅使用核定读数。提交时会在事务内读取其他圈的最新核定状态重算；若同一圈已被另一位裁判抢先改定、读数表已被更正版替换，或重算后无可行序列，则拒绝并保留原状。</p>
     <table class="laps">
       <thead>
         <tr>
           <th>圈</th>
           <th>读数（来源 / 累计）</th>
           <th>当前核定</th>
-          <th>操作</th>
+          {% if not historical %}<th>操作</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -75,14 +95,16 @@
           <td>
             {% if lap.pinned_reading_id %}
               {% set pinned = (lap.readings | selectattr('id', 'equalto', lap.pinned_reading_id) | list | first) %}
-              <span class="pill tone-good">已核定 · {{ pinned.source if pinned else '缺失' }}</span>
+              <span class="pill tone-good">已核定 · {{ pinned.source if pinned else '缺失' }}{% if pinned %} · {{ pinned.cumulative_ms }} ms{% endif %}</span>
             {% else %}
               <span class="muted">未核定（全部可行候选）</span>
             {% endif %}
           </td>
+          {% if not historical %}
           <td>
             <form method="post" action="{{ url_for('approve_reading', session_id=session.id) }}" class="inline-form">
               <input type="hidden" name="expected_pin" value="{{ lap.pinned_reading_id or 'none' }}">
+              <input type="hidden" name="readings_version" value="{{ session.laps_version }}">
               <input type="hidden" name="lap_number" value="{{ lap.lap_number }}">
               <select name="reading_id" aria-label="第 {{ lap.lap_number }} 圈核定读数">
                 {% for reading in lap.readings %}
@@ -96,20 +118,58 @@
             {% if lap.pinned_reading_id %}
               <form method="post" action="{{ url_for('approve_reading', session_id=session.id) }}" class="inline-form">
                 <input type="hidden" name="expected_pin" value="{{ lap.pinned_reading_id or 'none' }}">
+                <input type="hidden" name="readings_version" value="{{ session.laps_version }}">
                 <input type="hidden" name="lap_number" value="{{ lap.lap_number }}">
                 <input type="hidden" name="action" value="clear">
                 <button type="submit" class="secondary">取消核定</button>
               </form>
             {% endif %}
           </td>
+          {% endif %}
         </tr>
       {% endfor %}
       </tbody>
     </table>
   </section>
 
+  {% if not historical %}
   <section class="card">
-    <h2>最近核定记录</h2>
+    <h2>上传更正版读数表</h2>
+    <p class="muted">计时组发来更正版时，用原始格式 CSV 替换读数表。圈号范围必须与原批次一致；已核定读数须在新表中按同一圈号、来源和毫秒数保留，否则整次换表被拒绝并保留原结果。换表后按最新核定重新计算最快圈与结论，旧页面提交的已替换读数会被拒绝。</p>
+    <form method="post" action="{{ url_for('correct_session', session_id=session.id) }}" enctype="multipart/form-data" class="grid-form">
+      <input type="hidden" name="expected_version" value="{{ session.laps_version }}">
+      <label>更正版 CSV
+        <input type="file" name="csv_file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">上传并重新计算</button>
+    </form>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>更正版记录</h2>
+    {% if corrections %}
+      <table>
+        <thead><tr><th>读数表版本</th><th>批次版本</th><th>保留核定</th><th>未核定圈</th><th>时间</th></tr></thead>
+        <tbody>
+        {% for item in corrections %}
+          <tr>
+            <td class="num">v{{ item.previous_laps_version }} → v{{ item.laps_version }}</td>
+            <td class="num">{{ item.previous_revision }} → {{ item.revision }}</td>
+            <td class="num">{{ item.kept_pins }}</td>
+            <td class="num">{{ item.unpinned_laps }}</td>
+            <td class="muted">{{ item.created_at }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">尚未上传过更正版。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>{% if historical %}版本 {{ viewing_revision }} 的核定记录{% else %}最近核定记录{% endif %}</h2>
     {% if approvals %}
       <table>
         <thead><tr><th>版本</th><th>圈</th><th>核定读数</th><th>结论</th><th>时间</th></tr></thead>
@@ -126,7 +186,7 @@
         </tbody>
       </table>
     {% else %}
-      <p class="muted">尚未提交过核定。</p>
+      <p class="muted">{% if historical %}该版本没有核定操作。{% else %}尚未提交过核定。{% endif %}</p>
     {% endif %}
   </section>
 </main>

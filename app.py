@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     min_lap_ms INTEGER NOT NULL CHECK (min_lap_ms > 0),
     record_ms INTEGER NOT NULL CHECK (record_ms >= 0),
     revision INTEGER NOT NULL DEFAULT 1,
+    laps_version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -80,9 +82,10 @@ CREATE TABLE IF NOT EXISTS laps (
 CREATE TABLE IF NOT EXISTS readings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lap_id INTEGER NOT NULL REFERENCES laps(id),
+    table_version INTEGER NOT NULL DEFAULT 1,
     source TEXT NOT NULL,
     cumulative_ms INTEGER NOT NULL CHECK (cumulative_ms >= 0),
-    UNIQUE (lap_id, source)
+    UNIQUE (lap_id, table_version, source)
 );
 
 CREATE TABLE IF NOT EXISTS conclusions (
@@ -111,6 +114,39 @@ CREATE TABLE IF NOT EXISTS approvals (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    revision INTEGER NOT NULL,
+    laps_version INTEGER NOT NULL,
+    min_lap_ms INTEGER NOT NULL,
+    record_ms INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (session_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    previous_laps_version INTEGER NOT NULL,
+    laps_version INTEGER NOT NULL,
+    previous_revision INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    kept_pins INTEGER NOT NULL,
+    unpinned_laps INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+INDEXES = """
+CREATE INDEX IF NOT EXISTS readings_lap_version
+    ON readings (lap_id, table_version);
+CREATE INDEX IF NOT EXISTS conclusions_session_revision
+    ON conclusions (session_id, revision);
+CREATE INDEX IF NOT EXISTS approvals_session_revision
+    ON approvals (session_id, revision);
 """
 
 
@@ -152,6 +188,43 @@ def _transaction(connection: sqlite3.Connection):
         raise
     else:
         connection.execute("COMMIT")
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring pre-correction databases up to the versioned-reading schema."""
+
+    if "laps_version" not in _table_columns(connection, "sessions"):
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN laps_version INTEGER NOT NULL DEFAULT 1"
+        )
+
+    if "table_version" not in _table_columns(connection, "readings"):
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.executescript(
+                """
+                BEGIN;
+                CREATE TABLE readings_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lap_id INTEGER NOT NULL REFERENCES laps(id),
+                    table_version INTEGER NOT NULL DEFAULT 1,
+                    source TEXT NOT NULL,
+                    cumulative_ms INTEGER NOT NULL CHECK (cumulative_ms >= 0),
+                    UNIQUE (lap_id, table_version, source)
+                );
+                INSERT INTO readings_new (id, lap_id, table_version, source, cumulative_ms)
+                    SELECT id, lap_id, 1, source, cumulative_ms FROM readings;
+                DROP TABLE readings;
+                ALTER TABLE readings_new RENAME TO readings;
+                COMMIT;
+                """
+            )
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _normalise_source(raw: str) -> str:
@@ -273,15 +346,19 @@ def parse_csv(raw: bytes):
     return _parse_rows(text)
 
 
-def _readings_by_lap(connection: sqlite3.Connection, session_id: int):
+def _readings_by_lap(
+    connection: sqlite3.Connection,
+    session_id: int,
+):
     rows = connection.execute(
         """
         SELECT laps.lap_number, laps.pinned_reading_id,
-               readings.id AS reading_id, readings.source, readings.cumulative_ms
+               readings.id AS reading_id, readings.table_version,
+               readings.source, readings.cumulative_ms
         FROM laps
         JOIN readings ON readings.lap_id = laps.id
         WHERE laps.session_id = ?
-        ORDER BY laps.lap_number, readings.source
+        ORDER BY laps.lap_number, readings.table_version, readings.source
         """,
         (session_id,),
     ).fetchall()
@@ -301,11 +378,261 @@ def _readings_by_lap(connection: sqlite3.Connection, session_id: int):
         lap["readings"].append(
             {
                 "id": row["reading_id"],
+                "table_version": row["table_version"],
                 "source": row["source"],
                 "cumulative_ms": row["cumulative_ms"],
             }
         )
     return sorted(laps, key=lambda item: item["lap_number"])
+
+
+def _build_visible_laps(
+    all_laps: list[dict],
+    laps_version: int,
+    pins: dict[int, int | None],
+) -> list[dict]:
+    """Project stored data onto one reading-table version.
+
+    Rows are never deleted, so an audit view can ask for any older version.
+    ``pins`` holds each lap's current pin; when that pin belongs to another
+    table version it is shown as absent for the requested version.
+    """
+
+    visible: list[dict] = []
+    for lap in all_laps:
+        readings = [r for r in lap["readings"] if r["table_version"] == laps_version]
+        pin_id = pins.get(lap["lap_number"])
+        pinned = any(r["id"] == pin_id for r in readings)
+        visible.append(
+            {
+                "lap_number": lap["lap_number"],
+                "pinned_reading_id": pin_id if pinned else None,
+                "readings": readings,
+            }
+        )
+    return visible
+
+
+def _pin_entry(
+    all_laps: list[dict], lap_number: int, reading_id: int | None
+) -> dict | None:
+    """Describe a pin for the snapshot, keeping its status under its own table."""
+
+    if reading_id is None:
+        return None
+    lap = next((item for item in all_laps if item["lap_number"] == lap_number), None)
+    reading = None
+    if lap is not None:
+        reading = next((r for r in lap["readings"] if r["id"] == reading_id), None)
+    if reading is None:  # Defensive; foreign keys and app logic prevent this.
+        return {"reading_id": reading_id, "table_version": None,
+                "source": None, "cumulative_ms": None}
+    return {
+        "reading_id": reading_id,
+        "table_version": reading["table_version"],
+        "source": reading["source"],
+        "cumulative_ms": reading["cumulative_ms"],
+    }
+
+
+def _state_from_snapshot(snapshot: dict) -> dict:
+    pinned = {
+        entry["lap_number"]: entry.get("pin")
+        for entry in snapshot.get("laps", [])
+    }
+    return {
+        "revision": snapshot.get("revision"),
+        "laps_version": snapshot.get("laps_version"),
+        "min_lap_ms": snapshot.get("min_lap_ms"),
+        "record_ms": snapshot.get("record_ms"),
+        "created_at": snapshot.get("created_at"),
+        "pinned": pinned,
+        "laps": snapshot.get("laps", []),
+        "conclusion": snapshot.get("conclusion"),
+    }
+
+
+def _snapshot_json(snapshot: dict) -> str:
+    return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+
+
+def _state_from_revision(
+    connection: sqlite3.Connection,
+    session_id: int,
+    revision: int,
+) -> dict | None:
+    row = connection.execute(
+        "SELECT snapshot_json FROM revisions WHERE session_id = ? AND revision = ?",
+        (session_id, revision),
+    ).fetchone()
+    if row is None:
+        return None
+    return _state_from_snapshot(json.loads(row["snapshot_json"]))
+
+
+def _table_version_at(connection: sqlite3.Connection, session: sqlite3.Row, revision: int):
+    """Which reading-table version was active when ``revision`` was created."""
+
+    active = session["laps_version"]
+    for row in connection.execute(
+        """
+        SELECT previous_laps_version, laps_version, previous_revision, revision
+        FROM corrections WHERE session_id = ? ORDER BY revision
+        """,
+        (session["id"],),
+    ):
+        if revision <= row["previous_revision"]:
+            return row["previous_laps_version"]
+        if revision <= row["revision"]:
+            return row["laps_version"]
+        active = row["laps_version"]
+    return active
+
+
+def _synthesize_state(
+    connection: sqlite3.Connection,
+    session: sqlite3.Row,
+    revision: int,
+) -> dict | None:
+    """Rebuild a revision view for databases created before snapshots existed.
+
+    Revisions written by the current code always have a snapshot.  For data
+    imported by older versions we can still replay the conclusion and the
+    approval history against the reading-table version that was active then.
+    """
+
+    conclusion = connection.execute(
+        "SELECT * FROM conclusions WHERE session_id = ? AND revision = ?",
+        (session["id"], revision),
+    ).fetchone()
+    if conclusion is None:
+        return None
+
+    active_version = _table_version_at(connection, session, revision)
+    all_laps = _readings_by_lap(connection, session["id"])
+
+    pins: dict[int, int | None] = {}
+    for row in connection.execute(
+        """
+        SELECT lap_number, reading_id, source, cumulative_ms
+        FROM approvals
+        WHERE session_id = ? AND revision <= ?
+        ORDER BY revision, id
+        """,
+        (session["id"], revision),
+    ):
+        pins[row["lap_number"]] = row["reading_id"] if row["reading_id"] else None
+
+    lap_entries = []
+    for lap in _build_visible_laps(all_laps, active_version, pins):
+        pin_entry = None
+        if lap["pinned_reading_id"] is not None:
+            reading = next(
+                (r for r in lap["readings"] if r["id"] == lap["pinned_reading_id"]),
+                None,
+            )
+            if reading is not None:
+                pin_entry = {
+                    "reading_id": reading["id"],
+                    "table_version": reading["table_version"],
+                    "source": reading["source"],
+                    "cumulative_ms": reading["cumulative_ms"],
+                }
+        lap_entries.append(
+            {
+                "lap_number": lap["lap_number"],
+                "readings": [
+                    {
+                        "source": reading["source"],
+                        "cumulative_ms": reading["cumulative_ms"],
+                    }
+                    for reading in lap["readings"]
+                ],
+                "pin": pin_entry,
+            }
+        )
+
+    return {
+        "revision": revision,
+        "laps_version": active_version,
+        "min_lap_ms": conclusion["min_lap_ms"],
+        "record_ms": conclusion["record_ms"],
+        "created_at": conclusion["created_at"],
+        "conclusion": {
+            "lower_ms": conclusion["lower_ms"],
+            "upper_ms": conclusion["upper_ms"],
+            "status": conclusion["status"],
+            "reason": conclusion["reason"],
+        },
+        "laps": lap_entries,
+    }
+
+
+def _snapshot_state(
+    session: sqlite3.Row,
+    all_laps: list[dict],
+    revision: int,
+    conclusion: sqlite3.Row,
+) -> dict:
+    lap_entries = []
+    visible = _build_visible_laps(
+        all_laps,
+        session["laps_version"],
+        {item["lap_number"]: item["pinned_reading_id"] for item in all_laps},
+    )
+    for lap in visible:
+        lap_entries.append(
+            {
+                "lap_number": lap["lap_number"],
+                "readings": [
+                    {
+                        "source": reading["source"],
+                        "cumulative_ms": reading["cumulative_ms"],
+                    }
+                    for reading in lap["readings"]
+                ],
+                "pin": _pin_entry(
+                    all_laps, lap["lap_number"], lap["pinned_reading_id"]
+                ),
+            }
+        )
+    return {
+        "revision": revision,
+        "laps_version": session["laps_version"],
+        "min_lap_ms": session["min_lap_ms"],
+        "record_ms": session["record_ms"],
+        "created_at": conclusion["created_at"],
+        "conclusion": {
+            "lower_ms": conclusion["lower_ms"],
+            "upper_ms": conclusion["upper_ms"],
+            "status": conclusion["status"],
+            "reason": conclusion["reason"],
+        },
+        "laps": lap_entries,
+    }
+
+
+def _insert_snapshot(
+    connection: sqlite3.Connection,
+    session_id: int,
+    snapshot: dict,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO revisions (session_id, revision, laps_version, min_lap_ms,
+                               record_ms, snapshot_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            snapshot["revision"],
+            snapshot["laps_version"],
+            snapshot["min_lap_ms"],
+            snapshot["record_ms"],
+            _snapshot_json(snapshot),
+            snapshot["created_at"],
+        ),
+    )
 
 
 def _candidates(
@@ -389,6 +716,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     connection = _connect(database, initialise=True)
     try:
         connection.executescript(SCHEMA)
+        _migrate(connection)
+        connection.executescript(INDEXES)
     finally:
         connection.close()
 
@@ -503,7 +832,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                 lap_id = lap_cursor.lastrowid
                 for source, cumulative in readings:
                     connection.execute(
-                        "INSERT INTO readings (lap_id, source, cumulative_ms) VALUES (?, ?, ?)",
+                        """
+                        INSERT INTO readings (lap_id, table_version, source, cumulative_ms)
+                        VALUES (?, 1, ?, ?)
+                        """,
                         (lap_id, source, cumulative),
                     )
             connection.execute(
@@ -522,10 +854,52 @@ def create_app(test_config: dict | None = None) -> Flask:
                     timestamp,
                 ),
             )
+            session_row = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            conclusion_row = connection.execute(
+                "SELECT * FROM conclusions WHERE session_id = ? AND revision = 1",
+                (session_id,),
+            ).fetchone()
+            all_laps = _readings_by_lap(connection, session_id)
+            _insert_snapshot(
+                connection,
+                session_id,
+                _snapshot_state(session_row, all_laps, 1, conclusion_row),
+            )
 
         return redirect(url_for("review_session", session_id=session_id))
 
-    def render_review(session_id: int, error: str | None = None, status_code: int = 200):
+    def _session_revision_numbers(connection: sqlite3.Connection, session_id: int):
+        return [
+            row["revision"]
+            for row in connection.execute(
+                """
+                SELECT revision FROM revisions WHERE session_id = ?
+                UNION
+                SELECT revision FROM conclusions WHERE session_id = ?
+                ORDER BY revision DESC
+                """,
+                (session_id, session_id),
+            )
+        ]
+
+    def _current_view(connection: sqlite3.Connection, session: sqlite3.Row) -> dict:
+        all_laps = _readings_by_lap(connection, session["id"])
+        pins = {lap["lap_number"]: lap["pinned_reading_id"] for lap in all_laps}
+        return {
+            "laps": _build_visible_laps(all_laps, session["laps_version"], pins),
+            "conclusion": _latest_conclusion(connection, session["id"]),
+            "readings_version": session["laps_version"],
+            "readings_version_revision": session["revision"],
+        }
+
+    def render_review(
+        session_id: int,
+        error: str | None = None,
+        status_code: int = 200,
+        revision: int | None = None,
+    ):
         connection = get_db()
         session = connection.execute(
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -533,32 +907,174 @@ def create_app(test_config: dict | None = None) -> Flask:
         if session is None:
             return render_template("not_found.html"), 404
 
-        laps = _readings_by_lap(connection, session_id)
-        conclusion = _latest_conclusion(connection, session_id)
-        approvals = connection.execute(
-            """
-            SELECT * FROM approvals
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT 20
-            """,
-            (session_id,),
-        ).fetchall()
+        revisions = _session_revision_numbers(connection, session_id)
+        historical = False
+        state = None
+        if revision is not None:
+            state = _state_from_revision(connection, session_id, revision)
+            if state is None:
+                # Data written before snapshots existed: replay the recorded
+                # conclusion against the then-active reading table.
+                state = _synthesize_state(connection, session, revision)
+            if state is None and revision == session["revision"]:
+                # No history at all for the current revision; the live state
+                # is by definition that revision.
+                revision = None
+            elif state is None:
+                return render_review(
+                    session_id,
+                    f"版本 {revision} 不存在。",
+                    404,
+                )
+
+        if revision is not None:
+            if revision == session["revision"]:
+                # The current version: show live rows so the page can still be
+                # used for approval.  Older versions come from their snapshot.
+                view = _current_view(connection, session)
+                min_lap_ms = session["min_lap_ms"]
+                record_ms = session["record_ms"]
+                approvals = connection.execute(
+                    """
+                    SELECT * FROM approvals
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """,
+                    (session_id,),
+                ).fetchall()
+                corrections = connection.execute(
+                    "SELECT * FROM corrections WHERE session_id = ? ORDER BY id DESC",
+                    (session_id,),
+                ).fetchall()
+            else:
+                historical = True
+                laps = []
+                for entry in state["laps"]:
+                    readings = []
+                    for index, reading in enumerate(entry["readings"]):
+                        readings.append(
+                            {
+                                # Snapshots are immutable and read-only, so a
+                                # local synthetic id is enough for the template
+                                # to mark the approved reading.
+                                "id": f"v{revision}-{entry['lap_number']}-{index}",
+                                "source": reading["source"],
+                                "cumulative_ms": reading["cumulative_ms"],
+                                "table_version": None,
+                            }
+                        )
+                    pin = entry.get("pin")
+                    pinned_id = None
+                    if pin is not None and pin.get("source") is not None:
+                        match = next(
+                            (
+                                r
+                                for r in readings
+                                if r["source"] == pin["source"]
+                                and r["cumulative_ms"] == pin["cumulative_ms"]
+                            ),
+                            None,
+                        )
+                        if match is not None:
+                            pinned_id = match["id"]
+                        else:
+                            # The approved reading is not part of this
+                            # snapshot's table (possible for legacy revisions
+                            # after a correction); still show it explicitly.
+                            pinned_id = f"v{revision}-{entry['lap_number']}-pin"
+                            readings.append(
+                                {
+                                    "id": pinned_id,
+                                    "source": pin["source"],
+                                    "cumulative_ms": pin["cumulative_ms"],
+                                    "table_version": pin["table_version"],
+                                }
+                            )
+                    laps.append(
+                        {
+                            "lap_number": entry["lap_number"],
+                            "pinned_reading_id": pinned_id,
+                            "readings": readings,
+                        }
+                    )
+                view = {
+                    "laps": laps,
+                    "conclusion": state["conclusion"],
+                    "readings_version": state["laps_version"],
+                    "readings_version_revision": revision,
+                }
+                min_lap_ms = state["min_lap_ms"]
+                record_ms = state["record_ms"]
+                approvals = connection.execute(
+                    "SELECT * FROM approvals WHERE session_id = ? AND revision = ? ORDER BY id",
+                    (session_id, revision),
+                ).fetchall()
+                corrections = connection.execute(
+                    "SELECT * FROM corrections WHERE session_id = ? AND revision = ?",
+                    (session_id, revision),
+                ).fetchall()
+        else:
+            view = _current_view(connection, session)
+            approvals = connection.execute(
+                """
+                SELECT * FROM approvals
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (session_id,),
+            ).fetchall()
+            corrections = connection.execute(
+                "SELECT * FROM corrections WHERE session_id = ? ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+            min_lap_ms = session["min_lap_ms"]
+            record_ms = session["record_ms"]
+
+        conclusion = view["conclusion"]
+        if historical and conclusion is not None:
+            conclusion_for_template = dict(conclusion)
+            conclusion_for_template["revision"] = revision
+            conclusion_for_template["created_at"] = (
+                state.get("created_at") or conclusion_for_template.get("created_at")
+            )
+        else:
+            conclusion_for_template = conclusion
+
         return (
             render_template(
                 "review.html",
                 session=session,
-                laps=laps,
-                conclusion=conclusion,
+                laps=view["laps"],
+                conclusion=conclusion_for_template,
                 approvals=approvals,
+                corrections=corrections,
                 error=error,
+                revisions=revisions,
+                viewing_revision=revision,
+                readings_version=view["readings_version"],
+                readings_version_revision=view["readings_version_revision"],
+                historical=historical,
+                view_min_lap_ms=min_lap_ms,
+                view_record_ms=record_ms,
             ),
             status_code,
         )
 
     @app.get("/sessions/<int:session_id>")
     def review_session(session_id: int):
+        revision_raw = request.args.get("revision", "")
+        if revision_raw:
+            try:
+                return render_review(session_id, revision=int(revision_raw))
+            except ValueError:
+                return render_review(session_id, "版本号无效", 404)
         return render_review(session_id)
+
+    @app.get("/sessions/<int:session_id>/versions/<int:revision>")
+    def review_version(session_id: int, revision: int):
+        return render_review(session_id, revision=revision)
 
     @app.post("/sessions/<int:session_id>/approve")
     def approve_reading(session_id: int):
@@ -587,6 +1103,19 @@ def create_app(test_config: dict | None = None) -> Flask:
             except ValueError:
                 return render_review(session_id, "请选择一条要核定的读数", 409)
 
+        # The reading-table version the submitting page was rendered from.
+        # A correction that lands in between replaces readings, so this
+        # submission must be rejected instead of pinning a stale id.
+        expected_version_raw = request.form.get("readings_version", "")
+        expected_version: int | None
+        if expected_version_raw in ("", "none"):
+            expected_version = None
+        else:
+            try:
+                expected_version = int(expected_version_raw)
+            except ValueError:
+                return render_review(session_id, "缺少有效的读数表版本，请刷新后重试", 409)
+
         connection = get_db()
         session = connection.execute(
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -603,6 +1132,15 @@ def create_app(test_config: dict | None = None) -> Flask:
                 ).fetchone()
                 if session is None:
                     raise ReviewConflict("该复核批次已不存在")
+
+                if (
+                    expected_version is not None
+                    and session["laps_version"] != expected_version
+                ):
+                    raise ReviewConflict(
+                        "计时组已上传更正版读数表，本页面上的读数已被替换。"
+                        "本次提交未保存，原状态保持不变，请刷新后按最新读数表重新核定。"
+                    )
 
                 lap = connection.execute(
                     "SELECT * FROM laps WHERE session_id = ? AND lap_number = ?",
@@ -625,15 +1163,23 @@ def create_app(test_config: dict | None = None) -> Flask:
                 reading = None
                 if not clear:
                     reading = connection.execute(
-                        "SELECT * FROM readings WHERE id = ? AND lap_id = ?",
-                        (reading_id, lap["id"]),
+                        """
+                        SELECT * FROM readings
+                        WHERE id = ? AND lap_id = ? AND table_version = ?
+                        """,
+                        (reading_id, lap["id"], session["laps_version"]),
                     ).fetchone()
                     if reading is None:
-                        raise ReviewConflict("所选读数不属于该圈")
+                        raise ReviewConflict(
+                            "所选读数不属于该圈，或已被更正版读数表替换。"
+                            "本次提交未保存，原状态保持不变，请刷新后按最新读数重新核定。"
+                        )
 
                 # Read *latest* pins for all laps inside the write transaction,
                 # replacing the target lap with the newly selected reading.
-                laps = _readings_by_lap(connection, session_id)
+                all_laps = _readings_by_lap(connection, session_id)
+                pins = {item["lap_number"]: item["pinned_reading_id"] for item in all_laps}
+                laps = _build_visible_laps(all_laps, session["laps_version"], pins)
                 candidates = _candidates(
                     laps,
                     lap_number,
@@ -694,10 +1240,257 @@ def create_app(test_config: dict | None = None) -> Flask:
                         timestamp,
                     ),
                 )
+                pins_after_conclusion = connection.execute(
+                    "SELECT * FROM conclusions WHERE session_id = ? AND revision = ?",
+                    (session_id, new_revision),
+                ).fetchone()
+                refreshed_session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                _insert_snapshot(
+                    connection,
+                    session_id,
+                    _snapshot_state(
+                        refreshed_session,
+                        _readings_by_lap(connection, session_id),
+                        new_revision,
+                        pins_after_conclusion,
+                    ),
+                )
         except ReviewConflict as exc:
             return render_review(session_id, exc.message, 409)
 
         flash("核定已保存，结论已按最新核定重算。", "good")
+        return redirect(url_for("review_session", session_id=session_id))
+
+    @app.post("/sessions/<int:session_id>/correct")
+    def correct_session(session_id: int):
+        expected_version_raw = request.form.get("expected_version", "")
+        try:
+            expected_version = int(expected_version_raw)
+        except ValueError:
+            return render_review(
+                session_id, "缺少有效的读数表版本，请刷新后重试", 409
+            )
+
+        upload = request.files.get("csv_file")
+        if upload is None or not upload.filename:
+            return render_review(session_id, "请选择更正版 CSV 文件", 400)
+        raw = upload.read(MAX_CSV_BYTES + 1)
+        if len(raw) > MAX_CSV_BYTES:
+            return render_review(session_id, "CSV 文件过大（上限 2 MB）", 400)
+
+        try:
+            parsed = parse_csv(raw)
+        except CsvError as exc:
+            return render_review(session_id, str(exc), 400)
+
+        connection = get_db()
+        if connection.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone() is None:
+            return render_template("not_found.html"), 404
+
+        try:
+            with _transaction(connection):
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session is None:
+                    raise ReviewConflict("该复核批次已不存在")
+
+                if session["laps_version"] != expected_version:
+                    raise ReviewConflict(
+                        "读数表已被另一份更正版替换。本次上传未保存，"
+                        "原状态保持不变，请刷新后核对最新读数表再上传。"
+                    )
+
+                all_laps = _readings_by_lap(connection, session_id)
+                old_visible = _build_visible_laps(
+                    all_laps,
+                    session["laps_version"],
+                    {item["lap_number"]: item["pinned_reading_id"] for item in all_laps},
+                )
+
+                new_lap_numbers = [lap_number for lap_number, _readings in parsed]
+                old_lap_numbers = [item["lap_number"] for item in old_visible]
+                if new_lap_numbers != old_lap_numbers:
+                    raise ReviewConflict(
+                        "更正版圈号范围与原批次不一致：原批次为 1–"
+                        f"{old_lap_numbers[-1] if old_lap_numbers else 0} 圈，"
+                        f"更正版为 1–{new_lap_numbers[-1] if new_lap_numbers else 0} 圈。"
+                        "本次上传未保存，原状态保持不变。"
+                    )
+
+                lap_ids = {
+                    row["lap_number"]: row["id"]
+                    for row in connection.execute(
+                        "SELECT id, lap_number FROM laps WHERE session_id = ?",
+                        (session_id,),
+                    )
+                }
+
+                # Carry every approved reading into the new table by
+                # (lap, source), preserving lap number, source and milliseconds.
+                new_readings: dict[tuple[int, str], int] = {}
+                for lap_number, readings in parsed:
+                    for source, cumulative in readings:
+                        new_readings[(lap_number, source)] = cumulative
+
+                carried: dict[int, tuple[int, str]] = {}
+                lost: list[tuple[int, int | None, str | None]] = []
+                for lap in old_visible:
+                    pin_id = lap["pinned_reading_id"]
+                    if pin_id is None:
+                        continue
+                    pinned = next(
+                        (r for r in lap["readings"] if r["id"] == pin_id), None
+                    )
+                    if pinned is None:
+                        lost.append((lap["lap_number"], None, None))
+                        continue
+                    match = new_readings.get((lap["lap_number"], pinned["source"]))
+                    if match is None or match != pinned["cumulative_ms"]:
+                        lost.append(
+                            (lap["lap_number"], pinned["cumulative_ms"], pinned["source"])
+                        )
+                        continue
+                    carried[lap["lap_number"]] = (
+                        match,
+                        pinned["source"],
+                    )
+
+                if lost:
+                    parts = []
+                    for lap_number, cumulative, source in lost:
+                        if source is None:
+                            parts.append(f"第 {lap_number} 圈核定读数缺失")
+                        else:
+                            parts.append(
+                                f"第 {lap_number} 圈 {source} {cumulative} ms 缺失或被改动"
+                            )
+                    raise ReviewConflict(
+                        "更正版未保留全部已核定读数："
+                        + "；".join(parts)
+                        + "。本次上传未保存，原状态保持不变。"
+                    )
+
+                new_version = session["laps_version"] + 1
+                timestamp = _now()
+                for lap_number, readings in parsed:
+                    lap_id = lap_ids[lap_number]
+                    for source, cumulative in readings:
+                        connection.execute(
+                            """
+                            INSERT INTO readings (lap_id, table_version, source, cumulative_ms)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (lap_id, new_version, source, cumulative),
+                        )
+
+                new_pin_ids: dict[int, int | None] = {}
+                for lap_number, lap_id in lap_ids.items():
+                    if lap_number in carried:
+                        _cumulative, source = carried[lap_number]
+                        new_pin_ids[lap_number] = connection.execute(
+                            """
+                            SELECT id FROM readings
+                            WHERE lap_id = ? AND table_version = ? AND source = ?
+                            """,
+                            (lap_id, new_version, source),
+                        ).fetchone()["id"]
+                    else:
+                        new_pin_ids[lap_number] = None
+                    connection.execute(
+                        "UPDATE laps SET pinned_reading_id = ? WHERE id = ?",
+                        (new_pin_ids[lap_number], lap_id),
+                    )
+                new_all_laps = _readings_by_lap(connection, session_id)
+                candidates = _candidates(
+                    _build_visible_laps(
+                        new_all_laps,
+                        new_version,
+                        {
+                            item["lap_number"]: item["pinned_reading_id"]
+                            for item in new_all_laps
+                        },
+                    )
+                )
+
+                result = solve(candidates, session["min_lap_ms"], session["record_ms"])
+                if not result.feasible:
+                    reason = (result.reason or "没有完整可行序列").rstrip("。")
+                    raise ReviewConflict(
+                        "按最新核定在更正版读数表中找不到完整可行序列："
+                        + reason
+                        + "。本次上传未保存，原结果保持不变。"
+                    )
+
+                new_revision = session["revision"] + 1
+                connection.execute(
+                    "UPDATE sessions SET revision = ?, laps_version = ?, updated_at = ? WHERE id = ?",
+                    (new_revision, new_version, timestamp, session_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conclusions (session_id, revision, lower_ms, upper_ms,
+                                             status, min_lap_ms, record_ms, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        session_id,
+                        new_revision,
+                        result.lower_ms,
+                        result.upper_ms,
+                        result.status,
+                        session["min_lap_ms"],
+                        session["record_ms"],
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO corrections (session_id, previous_laps_version,
+                                             laps_version, previous_revision, revision,
+                                             kept_pins, unpinned_laps, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        session["laps_version"],
+                        new_version,
+                        session["revision"],
+                        new_revision,
+                        len(carried),
+                        len(old_visible) - len(carried),
+                        timestamp,
+                    ),
+                )
+                refreshed_session_row = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                conclusion_row = connection.execute(
+                    "SELECT * FROM conclusions WHERE session_id = ? AND revision = ?",
+                    (session_id, new_revision),
+                ).fetchone()
+                _insert_snapshot(
+                    connection,
+                    session_id,
+                    _snapshot_state(
+                        refreshed_session_row,
+                        new_all_laps,
+                        new_revision,
+                        conclusion_row,
+                    ),
+                )
+        except ReviewConflict as exc:
+            return render_review(session_id, exc.message, 409)
+
+        flash(
+            f"已换用更正版读数表（表版本 {new_version}），"
+            "已核定读数按圈号、来源和毫秒数保留并重新计算结论。",
+            "good",
+        )
         return redirect(url_for("review_session", session_id=session_id))
 
     return app
