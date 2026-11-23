@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>骑行赛计时复核</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ url_for('index') }}">骑行赛计时复核</a>
+</header>
+<main>
+  <section class="card">
+    <h1>导入计时读数</h1>
+    <p class="muted">CSV 需包含圈号、计时来源、发车后累计毫秒数三列（支持英文或中文表头）。每个来源每圈一行；首圈从 0 起算，任意相邻两圈差须不小于最短可信圈时。导入后会立即检查是否存在完整可行读数序列。</p>
+    {% if error %}
+      <div class="banner banner-bad" role="alert">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="{{ url_for('import_csv') }}" enctype="multipart/form-data" class="grid-form">
+      <label>批次名称
+        <input type="text" name="name" maxlength="200" placeholder="例如：2026 春季计时赛 · 车手 17">
+      </label>
+      <label>最短可信圈时（毫秒）
+        <input type="number" name="min_lap_ms" min="1" step="1" required value="60000">
+      </label>
+      <label>现有纪录（毫秒）
+        <input type="number" name="record_ms" min="0" step="1" required value="78000">
+      </label>
+      <label>计时读数 CSV
+        <input type="file" name="csv_file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">导入并复核</button>
+    </form>
+    <details class="hint">
+      <summary>CSV 示例</summary>
+<pre>lap,source,cumulative_ms
+1,主计时,74210
+1,备计时,74230
+2,主计时,148900
+2,备计时,148870</pre>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>复核批次</h2>
+    {% if sessions %}
+      <table>
+        <thead>
+          <tr><th>批次</th><th>圈数</th><th>最短可信圈时</th><th>现有纪录</th><th>当前结论</th><th>最快圈范围</th><th>版本</th><th></th></tr>
+        </thead>
+        <tbody>
+        {% for session in sessions %}
+          <tr>
+            <td>{{ session.name }}</td>
+            <td class="num">{{ session.lap_count }}</td>
+            <td class="num">{{ session.min_lap_ms | lap_time }}</td>
+            <td class="num">{{ session.record_ms | lap_time }}</td>
+            <td>
+              {% if session.status %}
+                <span class="pill tone-{{ status_tone.get(session.status, 'neutral') }}">{{ status_labels.get(session.status, session.status) }}</span>
+              {% else %}
+                <span class="muted">尚未导入</span>
+              {% endif %}
+            </td>
+            <td class="num">{% if session.lower_ms is not none %}{{ session.lower_ms | lap_time }} – {{ session.upper_ms | lap_time }}{% else %}—{% endif %}</td>
+            <td class="num">{{ session.revision }}</td>
+            <td><a class="button-link" href="{{ url_for('review_session', session_id=session.id) }}">打开</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">还没有批次。先在上方导入一份 CSV。</p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>

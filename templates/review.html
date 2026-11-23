@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ session.name }} · 骑行赛计时复核</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ url_for('index') }}">骑行赛计时复核</a>
+  <span class="muted">批次 #{{ session.id }} · 版本 {{ session.revision }}</span>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="banner banner-{{ category }}" role="status">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% if error %}
+    <div class="banner banner-bad" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <section class="card">
+    <h1>{{ session.name }}</h1>
+    <dl class="facts">
+      <div><dt>最短可信圈时</dt><dd>{{ session.min_lap_ms | lap_time }}</dd></div>
+      <div><dt>现有纪录</dt><dd>{{ session.record_ms | lap_time }}</dd></div>
+      <div><dt>圈数</dt><dd>{{ laps | length }}</dd></div>
+      <div><dt>提交版本</dt><dd>{{ session.revision }}</dd></div>
+    </dl>
+
+    {% if conclusion %}
+      <div class="verdict tone-{{ status_tone.get(conclusion.status, 'neutral') }}">
+        <div class="verdict-head">
+          <span class="pill tone-{{ status_tone.get(conclusion.status, 'neutral') }}">{{ status_labels.get(conclusion.status, conclusion.status) }}</span>
+          <span class="muted">版本 {{ conclusion.revision }} · {{ conclusion.created_at }}</span>
+        </div>
+        {% if conclusion.status == 'INFEASIBLE' %}
+          <p>{{ conclusion.reason }}</p>
+        {% else %}
+          <p>最快圈用时可达范围：<strong>{{ conclusion.lower_ms | lap_time }} – {{ conclusion.upper_ms | lap_time }}</strong></p>
+          <p class="muted">现有纪录 {{ conclusion.record_ms | lap_time }}。只有最快圈严格快于纪录才算破纪录；范围上端低于纪录为确定破纪录，范围下端不低于纪录为确定未破，二者之间为待核。</p>
+        {% endif %}
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>每圈读数</h2>
+    <p class="muted">未核定的圈会把该圈全部来源纳入可行序列；核定后仅使用核定读数。提交时会在事务内读取其他圈的最新核定状态重算；若同一圈已被另一位裁判抢先改定，或重算后无可行序列，则拒绝并保留原状。</p>
+    <table class="laps">
+      <thead>
+        <tr>
+          <th>圈</th>
+          <th>读数（来源 / 累计）</th>
+          <th>当前核定</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for lap in laps %}
+        <tr>
+          <td class="num">{{ lap.lap_number }}</td>
+          <td>
+            <div class="readings">
+            {% for reading in lap.readings %}
+              <span class="reading {% if reading.id == lap.pinned_reading_id %}reading-pinned{% endif %}">
+                <strong>{{ reading.source }}</strong>
+                <span class="num">{{ reading.cumulative_ms }} ms</span>
+              </span>
+            {% endfor %}
+            </div>
+          </td>
+          <td>
+            {% if lap.pinned_reading_id %}
+              {% set pinned = (lap.readings | selectattr('id', 'equalto', lap.pinned_reading_id) | list | first) %}
+              <span class="pill tone-good">已核定 · {{ pinned.source if pinned else '缺失' }}</span>
+            {% else %}
+              <span class="muted">未核定（全部可行候选）</span>
+            {% endif %}
+          </td>
+          <td>
+            <form method="post" action="{{ url_for('approve_reading', session_id=session.id) }}" class="inline-form">
+              <input type="hidden" name="expected_pin" value="{{ lap.pinned_reading_id or 'none' }}">
+              <input type="hidden" name="lap_number" value="{{ lap.lap_number }}">
+              <select name="reading_id" aria-label="第 {{ lap.lap_number }} 圈核定读数">
+                {% for reading in lap.readings %}
+                  <option value="{{ reading.id }}" {% if reading.id == lap.pinned_reading_id %}selected{% endif %}>
+                    {{ reading.source }} · {{ reading.cumulative_ms }} ms
+                  </option>
+                {% endfor %}
+              </select>
+              <button type="submit">核定此圈</button>
+            </form>
+            {% if lap.pinned_reading_id %}
+              <form method="post" action="{{ url_for('approve_reading', session_id=session.id) }}" class="inline-form">
+                <input type="hidden" name="expected_pin" value="{{ lap.pinned_reading_id or 'none' }}">
+                <input type="hidden" name="lap_number" value="{{ lap.lap_number }}">
+                <input type="hidden" name="action" value="clear">
+                <button type="submit" class="secondary">取消核定</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>最近核定记录</h2>
+    {% if approvals %}
+      <table>
+        <thead><tr><th>版本</th><th>圈</th><th>核定读数</th><th>结论</th><th>时间</th></tr></thead>
+        <tbody>
+        {% for item in approvals %}
+          <tr>
+            <td class="num">{{ item.revision }}</td>
+            <td class="num">{{ item.lap_number }}</td>
+            <td>{% if item.cumulative_ms is not none %}{{ item.source }} · {{ item.cumulative_ms }} ms{% else %}<span class="muted">取消核定</span>{% endif %}</td>
+            <td><span class="pill tone-{{ status_tone.get(item.status, 'neutral') }}">{{ status_labels.get(item.status, item.status) }}</span></td>
+            <td class="muted">{{ item.created_at }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">尚未提交过核定。</p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>
